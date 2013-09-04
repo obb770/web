@@ -4,3 +4,6 @@
 [submodule "www/qr"]
 	path = www/qr
 	url = https://github.com/obb770/qr.git
+[submodule "www/spider"]
+	path = www/spider
+	url = https://github.com/obb770/spider.git
