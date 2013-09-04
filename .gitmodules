@@ -1,3 +1,6 @@
 [submodule "www/weight"]
 	path = www/weight
 	url = https://github.com/obb770/weight.git
+[submodule "www/qr"]
+	path = www/qr
+	url = https://github.com/obb770/qr.git
