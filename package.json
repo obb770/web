@@ -1,0 +1,6 @@
+{
+    "name": "web-playground",
+    "engines": {
+        "node": "0.10.x"
+    }
+}
