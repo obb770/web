@@ -1,0 +1,3 @@
+[submodule "www/weight"]
+	path = www/weight
+	url = https://github.com/obb770/weight.git
