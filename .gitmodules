@@ -9,4 +9,4 @@
 	url = https://github.com/obb770/spider.git
 [submodule "www/colors"]
 	path = www/colors
-	url = https://github.com:obb770/colors.git
+	url = https://github.com/obb770/colors.git
