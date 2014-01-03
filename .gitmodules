@@ -7,3 +7,6 @@
 [submodule "www/spider"]
 	path = www/spider
 	url = https://github.com/obb770/spider.git
+[submodule "www/colors"]
+	path = www/colors
+	url = git@github.com:obb770/colors.git
