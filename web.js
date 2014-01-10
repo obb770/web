@@ -65,6 +65,8 @@ types = {
     'svg': 'image/svg+xml',
     'png': 'image/png',
     'mp4': 'video/mp4',
+    'mp3': 'audio/mpeg',
+    'wav': 'audio/vnd.wav',
     'js': 'text/javascript',
     'css': 'text/css',
     '': 'text/plain',
