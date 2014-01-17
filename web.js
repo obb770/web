@@ -1,3 +1,4 @@
+/*jshint node:true */
 'use strict';
 
 var http = require('http'),
@@ -13,16 +14,16 @@ var http = require('http'),
     redirect,
     types,
     sendFile,
+    sendManifest,
     handlers,
     serve,
-    run,
-    dummy;
+    run;
 
 log = function () {
     var str = util.format.apply(util, arguments);
     console.log('%s', str);
     buffer += '\n' + str;
-}
+};
 
 respond = function (response, code, type, body, headers) {
     if (!response) {
@@ -100,14 +101,12 @@ sendFile = function (response, pathName) {
         type = null;
     }
     stat = fs.existsSync(name) && fs.statSync(name);
+    if (type === 'manifest') {
+        i = name.lastIndexOf('/');
+        sendManifest(response, name, stat, name.substr(0, i + 1));
+        return;
+    }
     if (!stat || !stat.isFile()) {
-        if (type === 'manifest') {
-            i = name.lastIndexOf('/');
-            respond(response, 200, types[type], util.format(
-                    'CACHE MANIFEST\n# %s\n', 
-                    fs.statSync(name.substr(0, i + 1) + 'index.html').mtime));
-            return;
-        }
         respond(response, 404, 'text/plain', 'Not found');
         return;
     }
@@ -117,7 +116,7 @@ sendFile = function (response, pathName) {
     headers = {'Content-type': types[type], 'Content-length': size};
     if (response.request.headers.hasOwnProperty('range')) {
         match = /bytes=(\d*)-(\d*)/.exec(response.request.headers.range);
-        code = 206
+        code = 206;
         options = {start: 0, end: size - 1};
         if (match[1]) {
             options.start = parseInt(match[1]);
@@ -135,6 +134,40 @@ sendFile = function (response, pathName) {
             response.request.url + ' ' + code + ' ' +
             headers['Content-type'] + ' ' + headers['Content-length']);
     rs.pipe(response);
+};
+
+sendManifest = function (response, name, stat, prefix) {
+    var data, addTimestamp, lines, i;
+    if (stat && stat.isFile()) {
+        data = fs.readFileSync(name, {'encoding': 'utf8'});
+    }
+    else {
+        data = 'CACHE MANIFEST';
+    }
+    lines = data.split('\n');
+    data = [];
+    addTimestamp = function(f) {
+        var ts, stat;
+        try {
+            stat = fs.statSync(prefix + f);
+            if (stat && stat.isFile()) {
+                ts = util.format(
+                    '# %s', fs.statSync(prefix + f).mtime);
+                data.push(ts);
+            }
+        }
+        catch (e) {
+        }
+    };
+    for (i = 0; i < lines.length; i++) {
+        data.push(lines[i]);
+        if (lines[i].substr(0, 1) !== '/') {
+            addTimestamp(lines[i]);
+        }
+    }
+    addTimestamp('index.html');
+    data = data.join('\n');
+    respond(response, 200, types.manifest, data);
 };
 
 handlers = {};
@@ -173,6 +206,6 @@ serve = function (request, response) {
 run = function () {
     http.createServer(serve).listen(httpPort);
     log('Server running at port %d', httpPort);
-}
+};
 
 run();
