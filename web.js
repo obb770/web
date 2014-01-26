@@ -9,7 +9,6 @@ var http = require('http'),
     wwwRoot = 'www',
     log,
     buffer = '',
-    respond,
     redirect,
     types,
     sendFile,
@@ -24,35 +23,35 @@ log = function () {
     buffer += '\n' + str;
 };
 
-respond = function (response, code, type, body, headers) {
-    if (!response) {
-        log('null response');
-        return;
-    }
-    if (response.responded) {
+http.ServerResponse.prototype.start = function (code, type, headers, body) {
+    var msg;
+    if (this.responded) {
         log('Already responded (now: ' + code + ')');
         log(body);
         return;
     }
-    log(response.request.connection.remoteAddress + ' ' +
-            response.request.connection.remotePort + ' ' +
-            response.request.url + ' ' + code + ' ' + type);
+    this.responded = true;
+    headers['content-type'] = type;
+    msg = this.request.connection.remoteAddress + ' ' +
+        this.request.connection.remotePort + ' ' +
+        this.request.url + ' ' + code + ' ' + type;
+    if (headers.hasOwnProperty('content-length')) {
+        msg += ' ' + headers['content-length'];
+    }
+    this.writeHead(code, headers);
+    if (typeof body !== 'undefined') {
+        this.end(body);
+    }
+    log(msg);
     if (code != 200 || type === types.manifest) {
         log(body);
     }
-    if (!headers) {
-        headers = {};
-    }
-    headers['Content-type'] = type;
-    response.responded = true;
-    response.writeHead(code, headers);
-    response.end(body);
 };
 
 redirect = function (response, loc) {
-    respond(response, 302, 'text/html', util.format(
+    response.start(302, 'text/html', {'Location': loc}, util.format(
             '<html><body>The content is <a href="%s">here</a>.</body></html>',
-            loc), {'Location': loc});
+            loc));
 };
 
 types = {
@@ -86,13 +85,13 @@ sendFile = function (response, name) {
         return;
     }
     if (!stat || !stat.isFile()) {
-        respond(response, 404, 'text/plain', 'Not found');
+        response.start(404, 'text/plain', {}, 'Not found');
         return;
     }
     size = stat.size;
     code = 200;
     options = undefined;
-    headers = {'Content-type': types[type], 'Content-length': size};
+    headers = {'content-length': size};
     if (response.request.headers.hasOwnProperty('range')) {
         match = /bytes=(\d*)-(\d*)/.exec(response.request.headers.range);
         code = 206;
@@ -103,15 +102,12 @@ sendFile = function (response, name) {
         if (match[2]) {
             options.end = parseInt(match[2]);
         }
-        headers['Content-length'] = options.end - options.start + 1;
-        headers['Content-range'] =
+        headers['content-length'] = options.end - options.start + 1;
+        headers['content-range'] =
             'bytes ' + options.start + '-' + options.end + '/' + size;
     } 
     rs = fs.createReadStream(name, options);
-    response.writeHead(code, headers);
-    log(response.request.connection.remoteAddress + ' ' +
-            response.request.url + ' ' + code + ' ' +
-            headers['Content-type'] + ' ' + headers['Content-length']);
+    response.start(code, types[type], headers);
     rs.pipe(response);
 };
 
@@ -146,7 +142,7 @@ sendManifest = function (response, name, stat, prefix) {
     }
     addTimestamp('index.html');
     data = data.join('\n');
-    respond(response, 200, types.manifest, data);
+    response.start(200, types.manifest, {}, data);
 };
 
 apps = {};
@@ -154,25 +150,23 @@ apps = {};
 serve = function (request, response) {
     var req = require('url').parse(request.url, true),
         doLater;
-    response.responded = false;
     response.request = request;
+    response.responded = false;
     doLater = function (delay, callback) {
         setTimeout(function () {
             try {
                 callback();
             }
             catch (e) {
-                respond(response, 500, 
-                        'text/plain', util.format(
-                                'Failed to handle:\n%j\n%s',
-                                req, e.stack));
+                response.start(500, 'text/plain', {}, util.format(
+                    'Failed to handle:\n%j\n%s', req, e.stack));
             }
         }, delay);
     };
     doLater(0, function () {
-        var name, stat, appDir, appObj, appIndex, script, params;
+        var name, stat, appDir, appObj, appIndex, script;
         if (req.pathname === '/favicon.ico') {
-            respond(response, 404, 'text/plain', '');
+            response.start(404, 'text/plain', {}, '');
             return;
         }
         name = req.pathname;
@@ -206,12 +200,10 @@ serve = function (request, response) {
         if (appObj.handlers) {
             script = path.basename(req.pathname);
             if (appObj.handlers.hasOwnProperty(script)) {
-                params = appObj.handlers[script](response, req.query);
-                params.unshift(response);
-                respond.apply(undefined, params);
+                appObj.handlers[script](response, req.query);
                 return;
             }
-            respond(response, 404, 'text/plain', '');
+            response.start(404, 'text/plain', {}, '');
             return;
         }
         sendFile(response, name);
