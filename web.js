@@ -10,12 +10,11 @@ var http = require('http'),
     log,
     buffer = '',
     respond,
-    respondJSON,
     redirect,
     types,
     sendFile,
     sendManifest,
-    handlers,
+    apps,
     serve,
     run;
 
@@ -50,10 +49,6 @@ respond = function (response, code, type, body, headers) {
     response.end(body);
 };
 
-respondJSON = function (response, obj) {
-    respond(response, 200, 'application/json', util.format('%j', obj));
-};
-
 redirect = function (response, loc) {
     respond(response, 302, 'text/html', util.format(
             '<html><body>The content is <a href="%s">here</a>.</body></html>',
@@ -74,24 +69,8 @@ types = {
     null: 'application/octet-stream'
 };
 
-sendFile = function (response, pathName) {
-    var name, stat, i, type, size, rs, code, match, options, headers;
-    name = pathName;
-    if (/\/\./.test(name) || name[0] !== '/') {
-        throw new Error("Bad file");
-    }
-    if (name !== '/') {
-        name = name.substr(1);
-    }
-    name = path.join(wwwRoot, name);
-    stat = fs.existsSync(name) && fs.statSync(name);
-    if (stat && stat.isDirectory() && name[name.length - 1] !== '/') {
-        redirect(response, pathName + '/');
-        return;
-    }
-    if (name[name.length - 1] === '/') {
-        name += 'index.html';
-    }
+sendFile = function (response, name) {
+    var stat, i, type, size, rs, code, match, options, headers;
     i = name.lastIndexOf('.');
     if (i < 0) {
         i = name.lastIndexOf('/');
@@ -170,7 +149,7 @@ sendManifest = function (response, name, stat, prefix) {
     respond(response, 200, types.manifest, data);
 };
 
-handlers = {};
+apps = {};
 
 serve = function (request, response) {
     var req = require('url').parse(request.url, true),
@@ -191,15 +170,51 @@ serve = function (request, response) {
         }, delay);
     };
     doLater(0, function () {
+        var name, stat, appDir, appObj, appIndex, script, params;
         if (req.pathname === '/favicon.ico') {
             respond(response, 404, 'text/plain', '');
             return;
         }
-        if (!handlers.hasOwnProperty(req.pathname)) {
-            sendFile(response, req.pathname);
+        name = req.pathname;
+        if (/\/\./.test(name) || name[0] !== '/') {
+            throw new Error("Bad file");
+        }
+        if (name !== '/') {
+            name = name.substr(1);
+        }
+        name = path.join(wwwRoot, name);
+        name = path.normalize(name);
+        name = path.resolve(name);
+        stat = fs.existsSync(name) && fs.statSync(name);
+        if (stat && stat.isDirectory()) {
+            if (req.pathname[req.pathname.length - 1] !== '/') {
+                redirect(response, req.pathname + '/');
+                return;
+            }
+            name = path.join(name, 'index.html');
+        }
+        appDir = path.dirname(name);
+        appObj = {'handlers': null};
+        if (!apps.hasOwnProperty(appDir)) {
+            appIndex = path.join(appDir, 'index.js');
+            if (fs.existsSync(appIndex)) {
+                appObj.handlers = require(appIndex).handlers;
+            }
+            apps[appDir] = appObj;
+        }
+        appObj = apps[appDir];
+        if (appObj.handlers) {
+            script = path.basename(req.pathname);
+            if (appObj.handlers.hasOwnProperty(script)) {
+                params = appObj.handlers[script](response, req.query);
+                params.unshift(response);
+                respond.apply(undefined, params);
+                return;
+            }
+            respond(response, 404, 'text/plain', '');
             return;
         }
-        handlers[req.pathname](response, req.query);
+        sendFile(response, name);
     });
 };
 
