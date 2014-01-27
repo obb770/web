@@ -166,7 +166,7 @@ serve = function (request, response) {
     doLater(0, function () {
         var name, stat, appDir, appObj, appIndex, script;
         if (req.pathname === '/favicon.ico') {
-            response.start(404, 'text/plain', {}, '');
+            response.start(404, 'text/plain', {}, 'Not found');
             return;
         }
         name = req.pathname;
@@ -198,13 +198,14 @@ serve = function (request, response) {
         }
         appObj = apps[appDir];
         if (appObj.handlers) {
-            script = path.basename(req.pathname);
+            script = '';
+            if (req.pathname[req.pathname.length - 1] !== '/') {
+                script = path.basename(req.pathname);
+            }
             if (appObj.handlers.hasOwnProperty(script)) {
                 appObj.handlers[script](response, req.query);
                 return;
             }
-            response.start(404, 'text/plain', {}, '');
-            return;
         }
         sendFile(response, name);
     });
