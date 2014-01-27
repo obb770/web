@@ -43,7 +43,7 @@ http.ServerResponse.prototype.start = function (code, type, headers, body) {
         this.end(body);
     }
     log(msg);
-    if (code != 200 || type === types.manifest) {
+    if (Math.floor(code / 10) * 10 !== 200 || type === types.manifest) {
         log(body);
     }
 };
