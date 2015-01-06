@@ -56,6 +56,7 @@ redirect = function (response, loc) {
 
 types = {
     'manifest': 'text/cache-manifest',
+    'webapp': 'application/x-web-app-manifest+json',
     'html': 'text/html',
     'svg': 'image/svg+xml',
     'png': 'image/png',
