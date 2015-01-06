@@ -10,3 +10,6 @@
 [submodule "www/colors"]
 	path = www/colors
 	url = https://github.com/obb770/colors.git
+[submodule "www/pentomino"]
+	path = www/pentomino
+	url = https://github.com/obb770/pentomino.git
