@@ -65,6 +65,7 @@ types = {
     'wav': 'audio/vnd.wav',
     'js': 'text/javascript',
     'css': 'text/css',
+    'txt': 'text/plain',
     '': 'text/plain',
     null: 'application/octet-stream'
 };
