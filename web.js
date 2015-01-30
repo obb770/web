@@ -109,6 +109,9 @@ sendFile = function (response, name) {
     } 
     rs = fs.createReadStream(name, options);
     response.start(code, types[type], headers);
+    rs.on('error', function (e) {
+        log(e.stack);
+    });
     rs.pipe(response);
 };
 
