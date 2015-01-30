@@ -148,8 +148,9 @@ sendManifest = function (response, name, stat, prefix) {
 
 apps = {};
 
-serve = function (request, response) {
+serve = function (request, response, head) {
     var req = require('url').parse(request.url, true),
+        isUpgrade = typeof head != 'undefined',
         doLater;
     response.request = request;
     response.responded = false;
@@ -159,13 +160,23 @@ serve = function (request, response) {
                 callback();
             }
             catch (e) {
-                response.start(500, 'text/plain', {}, util.format(
-                    'Failed to handle:\n%j\n%s', req, e.stack));
+                if (isUpgrade) {
+                    response.write('HTTP/1.1 500 ' + e + '\r\n' +
+                        'Content-Length: 0\r\n' +
+                        '\r\n');
+                }
+                else {
+                    response.start(500, 'text/plain', {}, util.format(
+                        'Failed to handle:\n%j\n%s', req, e.stack));
+                }
             }
         }, delay);
     };
     doLater(0, function () {
-        var name, stat, appDir, appObj, appIndex, script;
+        var name, stat, appDir, appObj, appIndex, script, token;
+        if (isUpgrade && request.headers.upgrade !== 'websocket') {
+            throw new Error('Non websocket upgrade');
+        }
         if (req.pathname === '/favicon.ico') {
             response.start(404, 'text/plain', {}, 'Not found');
             return;
@@ -197,23 +208,34 @@ serve = function (request, response) {
             }
             apps[appDir] = appObj;
         }
+        script = '';
+        if (req.pathname[req.pathname.length - 1] !== '/') {
+            script = path.basename(req.pathname);
+        }
         appObj = apps[appDir];
-        if (appObj.handlers) {
-            script = '';
-            if (req.pathname[req.pathname.length - 1] !== '/') {
-                script = path.basename(req.pathname);
+        if (appObj.handlers && appObj.handlers.hasOwnProperty(script)) {
+            if (isUpgrade) {
+                token = request.headers['sec-websocket-key'];
+                token += '258EAFA5-E914-47DA-95CA-C5AB0DC85B11';
+                token = require('crypto').createHash('sha1').update(
+                    token).digest('base64');
+                response.write('HTTP/1.1 101 Switching Protocols\r\n' + 
+                    'Upgrade: websocket\r\n' +
+                    'Connection: Upgrade\r\n' +
+                    'Sec-WebSocket-Accept: ' + token + '\r\n' +
+                    '\r\n');
             }
-            if (appObj.handlers.hasOwnProperty(script)) {
-                appObj.handlers[script](response, req.query);
-                return;
-            }
+            appObj.handlers[script](response, req.query);
+            return;
         }
         sendFile(response, name);
     });
 };
 
 run = function () {
-    http.createServer(serve).listen(httpPort);
+    var server = http.createServer(serve);
+    server.on('upgrade', serve);
+    server.listen(httpPort);
     log('Server running at port %d', httpPort);
 };
 
