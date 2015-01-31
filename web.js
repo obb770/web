@@ -13,6 +13,7 @@ var http = require('http'),
     types,
     sendFile,
     sendManifest,
+    handleSocket,
     apps,
     serve,
     run;
@@ -150,12 +151,116 @@ sendManifest = function (response, name, stat, prefix) {
     response.start(200, types.manifest, {}, data);
 };
 
+handleSocket = function (sock) {
+    var request = sock.request,
+        token = request.headers['sec-websocket-key'],
+        isBinary,
+        message = new Buffer(0);
+    token += '258EAFA5-E914-47DA-95CA-C5AB0DC85B11';
+    token = require('crypto').createHash('sha1').update(
+        token).digest('base64');
+    sock.write('HTTP/1.1 101 Switching Protocols\r\n' + 
+        'Upgrade: websocket\r\n' +
+        'Connection: Upgrade\r\n' +
+        'Sec-WebSocket-Accept: ' + token + '\r\n' +
+        '\r\n');
+    log(request.connection.remoteAddress + ' ' +
+        request.connection.remotePort + ' ' +
+        request.url + ' 101 websocket');
+    sock.send = function (msg, opcode) {
+        var len = msg.length,
+            hlen = 2,
+            header = new Buffer(10);
+        header[0] = 0x80 | opcode;
+        header[1] = len;
+        if (len > 125) {
+            if (len < 0x10000) {
+                hlen = 4;
+                header[1] = 126;
+                header.writeUInt16BE(len, 2);
+            }
+            else {
+                hlen = 10;
+                header[1] = 127;
+                header.writeUInt32BE(Math.floor(len / 0x100000000), 2);
+                header.writeUInt32BE(len & 0xffffffff, 6);
+            }
+        }
+        log('send header: ' + header.slice(0, hlen).toString('hex'));
+        sock.write(header.slice(0, hlen));
+        log('send message: ' + msg.toString('hex'));
+        sock.write(msg);
+    };
+    sock.on('data', function (data) {
+        var isFin, opcode, off, len, mask, i, frag;
+        log('frame: ' + data.toString('hex'));
+        isFin = data[0] & 0x80 !== 0;
+        opcode = data[0] & 0x0f;
+        log('opcode: ' + opcode);
+        mask = data[1] & 0x80 !== 0;
+        len = data[1] & 0x7f;
+        off = 2;
+        if (len === 126) {
+            len = data.readUInt16BE(off);
+            off += 2;
+        }
+        else if (len === 127) {
+            len = data.readUInt32(off) * 0x100000000 +
+                data.readUInt32(off + 4);
+            off += 8
+        }
+        log('length: ' + len);
+        if (mask) {
+            mask = data.slice(off, off + 4);
+            off += 4;
+        }
+        frag = data.slice(off);
+        for (i = 0; i < frag.length; i++) {
+            frag[i] ^= mask[i % 4];
+        }
+        log('frag: ' + frag.toString('hex'));
+        if (opcode === 0 || opcode === 1 || opcode === 2) {
+            message = Buffer.concat([message, frag]);
+            if (isFin) {
+                log('message: ' + message.toString('hex'));
+                sock.onmessage(message,
+                    opcode > 0 ? opcode : (isBinary ? 2 : 1));
+                message = new Buffer(0);
+            }
+            return;
+        }
+        log('control: ' + frag.toString('hex'));
+        if (opcode === 8) {  // close
+            // FIXME: handle close
+            return;
+        }
+        if (opcode === 9) {  // ping
+            sock.send(frag, 10);
+            return;
+        }
+        if (opcode === 10) {  // pong
+            // FIXME: handle pong
+            return;
+        }
+    });
+    sock.on('end', function () {
+        // FIXME: do something
+        log('socket ended...');
+    });
+};
+
 apps = {};
 
 serve = function (request, response, head) {
     var req = require('url').parse(request.url, true),
         isUpgrade = typeof head != 'undefined',
         doLater;
+    request.on('error', function (e) {
+        log(e.stack);
+    });
+    response.on('error', function (e) {
+        log(e.stack);
+    });
     response.request = request;
     response.responded = false;
     doLater = function (delay, callback) {
@@ -219,15 +324,7 @@ serve = function (request, response, head) {
         appObj = apps[appDir];
         if (appObj.handlers && appObj.handlers.hasOwnProperty(script)) {
             if (isUpgrade) {
-                token = request.headers['sec-websocket-key'];
-                token += '258EAFA5-E914-47DA-95CA-C5AB0DC85B11';
-                token = require('crypto').createHash('sha1').update(
-                    token).digest('base64');
-                response.write('HTTP/1.1 101 Switching Protocols\r\n' + 
-                    'Upgrade: websocket\r\n' +
-                    'Connection: Upgrade\r\n' +
-                    'Sec-WebSocket-Accept: ' + token + '\r\n' +
-                    '\r\n');
+                handleSocket(response);
             }
             appObj.handlers[script](response, req.query);
             return;
