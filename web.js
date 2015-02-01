@@ -154,8 +154,17 @@ sendManifest = function (response, name, stat, prefix) {
 handleSocket = function (sock) {
     var request = sock.request,
         token = request.headers['sec-websocket-key'],
-        isBinary,
-        message = new Buffer(0);
+        LIMIT = 100,
+
+        // state for message parsing
+        opcode,
+        message = new Buffer(0),
+        head = new Buffer(2),
+        fragLen,
+        frag = null,
+        buf = head,
+        bufOff = 0;
+
     token += '258EAFA5-E914-47DA-95CA-C5AB0DC85B11';
     token = require('crypto').createHash('sha1').update(
         token).digest('base64');
@@ -167,6 +176,7 @@ handleSocket = function (sock) {
     log(request.connection.remoteAddress + ' ' +
         request.connection.remotePort + ' ' +
         request.url + ' 101 websocket');
+
     sock.send = function (msg, opcode) {
         var len = msg.length,
             hlen = 2,
@@ -188,59 +198,83 @@ handleSocket = function (sock) {
         }
         log('send header: ' + header.slice(0, hlen).toString('hex'));
         sock.write(header.slice(0, hlen));
-        log('send message: ' + msg.toString('hex'));
+        log('send message: ' + msg.toString('hex', 0, LIMIT) +
+            (msg.length > LIMIT ? '...' : ''));
         sock.write(msg);
     };
+
     sock.on('data', function (data) {
-        var isFin, opcode, off, len, mask, i, frag;
-        log('frame: ' + data.toString('hex'));
-        isFin = data[0] & 0x80 !== 0;
-        opcode = data[0] & 0x0f;
-        log('opcode: ' + opcode);
-        mask = data[1] & 0x80 !== 0;
-        len = data[1] & 0x7f;
-        off = 2;
-        if (len === 126) {
-            len = data.readUInt16BE(off);
-            off += 2;
-        }
-        else if (len === 127) {
-            len = data.readUInt32(off) * 0x100000000 +
-                data.readUInt32(off + 4);
-            off += 8
-        }
-        log('length: ' + len);
-        if (mask) {
-            mask = data.slice(off, off + 4);
-            off += 4;
-        }
-        frag = data.slice(off);
-        for (i = 0; i < frag.length; i++) {
-            frag[i] ^= mask[i % 4];
-        }
-        log('frag: ' + frag.toString('hex'));
-        if (opcode === 0 || opcode === 1 || opcode === 2) {
-            message = Buffer.concat([message, frag]);
-            if (isFin) {
-                log('message: ' + message.toString('hex'));
-                sock.onmessage(message,
-                    opcode > 0 ? opcode : (isBinary ? 2 : 1));
-                message = new Buffer(0);
+        var max, maskLen, i;
+        log('data[' + data.length + ']: ' + data.toString('hex', 0, LIMIT) +
+            (data.length > LIMIT ? '...' : ''));
+        while (true) {
+            max = buf.length - bufOff;
+            if (max > data.length) {
+                max = data.length;
             }
-            return;
-        }
-        log('control: ' + frag.toString('hex'));
-        if (opcode === 8) {  // close
-            // FIXME: handle close
-            return;
-        }
-        if (opcode === 9) {  // ping
-            sock.send(frag, 10);
-            return;
-        }
-        if (opcode === 10) {  // pong
-            // FIXME: handle pong
-            return;
+            data.copy(buf, bufOff, 0, max);
+            bufOff += max;
+            data = data.slice(max, data.length);
+            if (bufOff < buf.length) {
+                return;
+            }
+            bufOff = 0;
+            maskLen = (head[1] & 0x80) !== 0 ? 4 : 0;
+            if (buf === head) {
+                log('head: ' + head.toString('hex'));
+                if ((head[0] & 0x0f) !== 0) {
+                    opcode = head[0] & 0x0f;
+                }
+                fragLen = head[1] & 0x7f;
+                if (fragLen > 125) {
+                    buf = new Buffer(fragLen < 127 ? 2 : 8);
+                    continue;
+                }
+                frag = new Buffer(maskLen + fragLen);
+                buf = frag;
+                continue;
+            }
+            if (buf === frag) {
+                log('frag: ' + opcode + ' ' + fragLen);
+                if (maskLen) {
+                    for (i = maskLen; i < frag.length; i++) {
+                        frag[i] ^= frag[i % maskLen];
+                    }
+                }
+                frag = Buffer.concat([message, frag.slice(maskLen)]);
+                buf = head;
+                if ((head[0] & 0x80) === 0) {  // !fin
+                    message = frag;
+                    continue;
+                }
+                message = new Buffer(0);
+                if ((head[0] & 0xf) <= 2) {
+                    log('message[' + frag.length + ']: ' +
+                        frag.toString('hex', 0, LIMIT) +
+                        (frag.length > LIMIT ? '...' : ''));
+                    sock.onmessage(frag, opcode);
+                    continue;
+                }
+                log('control: ' + frag.toString('hex'));
+                if (opcode === 8) {  // close
+                    // FIXME: handle close
+                    continue;
+                }
+                if (opcode === 9) {  // ping
+                    sock.send(frag, 10);
+                    continue;
+                }
+                if (opcode === 10) {  // pong
+                    // FIXME: handle pong
+                    continue;
+                }
+            }
+            // buf has the value of fragLen
+            fragLen = buf.length === 2 ? buf.readUInt16BE(0) :
+                buf.readUInt32BE(0) * 0x100000000 + buf.readUInt32BE(4);
+            log('len: ' + buf.toString('hex'));
+            frag = new Buffer(maskLen + fragLen);
+            buf = frag;
         }
     });
     sock.on('end', function () {
