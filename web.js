@@ -8,6 +8,7 @@ var http = require('http'),
     httpPort = process.env.PORT || 8080,
     wwwRoot = 'www',
     log,
+    debug,
     buffer = '',
     redirect,
     types,
@@ -22,6 +23,12 @@ log = function () {
     var str = util.format.apply(util, arguments);
     console.log('%s', str);
     buffer += '\n' + str;
+};
+
+debug = function () {
+    if (false) {
+        log.apply(this, arguments);
+    }
 };
 
 http.ServerResponse.prototype.start = function (code, type, headers, body) {
@@ -108,7 +115,7 @@ sendFile = function (response, name) {
         headers['content-length'] = options.end - options.start + 1;
         headers['content-range'] =
             'bytes ' + options.start + '-' + options.end + '/' + size;
-    } 
+    }
     rs = fs.createReadStream(name, options);
     response.start(code, types[type], headers);
     rs.on('error', function (e) {
@@ -153,29 +160,49 @@ sendManifest = function (response, name, stat, prefix) {
 
 handleSocket = function (sock) {
     var request = sock.request,
+        respond,
         token = request.headers['sec-websocket-key'],
-        LIMIT = 100,
+        LIMIT = 100;
 
-        // state for message parsing
-        opcode,
-        message = new Buffer(0),
-        head = new Buffer(2),
-        fragLen,
-        frag = null,
-        buf = head,
-        bufOff = 0;
+    respond = function (token, message, headers) {
+        var status = token ? ' 101 websocket' : ' 400' +  + ' ' + message;
+        log(request.connection.remoteAddress + ' ' +
+            request.connection.remotePort + ' ' +
+            request.url + status);
+        if (token) {
+            sock.write('HTTP/1.1 101 Switching Protocols\r\n' +
+                'Upgrade: websocket\r\n' +
+                'Connection: Upgrade\r\n' +
+                'Sec-WebSocket-Accept: ' + token + '\r\n' +
+                '\r\n');
+            return;
+        }
+        sock.write('HTTP/1.1' + status + '\r\n' +
+            headers.join('\r\n') + '\r\n' +
+            'Content-Length: 0\r\n' +
+            '\r\n');
+    };
 
+    if (request.headers.upgrade.toLowerCase() !== 'websocket') {
+        respond(null, 'Non websocket upgrade', []);
+        return;
+    }
+    if (request.headers.connection.toLowerCase() !== 'upgrade') {
+        respond(null, 'Non upgrade connection', []);
+        return;
+    }
+    if (request.headers['sec-websocket-version'] !== '13') {
+        respond(null, 'Bad version', ['Sec-WebSocket-Version: 13']);
+        return;
+    }
+    if (new Buffer(token, 'base64').length !== 16) {
+        respond(null, 'Bad key length', []);
+        return;
+    }
     token += '258EAFA5-E914-47DA-95CA-C5AB0DC85B11';
     token = require('crypto').createHash('sha1').update(
         token).digest('base64');
-    sock.write('HTTP/1.1 101 Switching Protocols\r\n' + 
-        'Upgrade: websocket\r\n' +
-        'Connection: Upgrade\r\n' +
-        'Sec-WebSocket-Accept: ' + token + '\r\n' +
-        '\r\n');
-    log(request.connection.remoteAddress + ' ' +
-        request.connection.remotePort + ' ' +
-        request.url + ' 101 websocket');
+    respond(token);
 
     sock.send = function (msg, opcode) {
         var len = msg.length,
@@ -196,87 +223,105 @@ handleSocket = function (sock) {
                 header.writeUInt32BE(len & 0xffffffff, 6);
             }
         }
-        log('send header: ' + header.slice(0, hlen).toString('hex'));
+        debug('send header: ' + header.slice(0, hlen).toString('hex'));
         sock.write(header.slice(0, hlen));
-        log('send message: ' + msg.toString('hex', 0, LIMIT) +
+        debug('send message: ' + msg.toString('hex', 0, LIMIT) +
             (msg.length > LIMIT ? '...' : ''));
         sock.write(msg);
     };
 
-    sock.on('data', function (data) {
-        var max, maskLen, i;
-        log('data[' + data.length + ']: ' + data.toString('hex', 0, LIMIT) +
-            (data.length > LIMIT ? '...' : ''));
-        while (true) {
-            max = buf.length - bufOff;
-            if (max > data.length) {
-                max = data.length;
-            }
-            data.copy(buf, bufOff, 0, max);
-            bufOff += max;
-            data = data.slice(max, data.length);
-            if (bufOff < buf.length) {
-                return;
-            }
+    sock.on('data', (function () {
+        var opcode,
+            message = new Buffer(0),
+            headBuf = new Buffer(2),
+            lenBuf = new Buffer(0),
+            fragBuf = new Buffer(0),
+            buf = headBuf,
             bufOff = 0;
-            maskLen = (head[1] & 0x80) !== 0 ? 4 : 0;
-            if (buf === head) {
-                log('head: ' + head.toString('hex'));
-                if ((head[0] & 0x0f) !== 0) {
-                    opcode = head[0] & 0x0f;
+        return function (data) {
+            var max, maskLen, fragLen, i;
+            debug('data[' + data.length + ']: ' +
+                data.toString('hex', 0, LIMIT) +
+                (data.length > LIMIT ? '...' : ''));
+            while (true) {
+                max = buf.length - bufOff;
+                if (max > data.length) {
+                    max = data.length;
                 }
-                fragLen = head[1] & 0x7f;
-                if (fragLen > 125) {
-                    buf = new Buffer(fragLen < 127 ? 2 : 8);
+                data.copy(buf, bufOff, 0, max);
+                bufOff += max;
+                data = data.slice(max, data.length);
+                if (bufOff < buf.length) {
+                    return;
+                }
+
+                bufOff = 0;
+                maskLen = (headBuf[1] & 0x80) !== 0 ? 4 : 0;
+                fragLen = headBuf[1] & 0x7f;
+                if (buf === headBuf) {
+                    debug('headBuf: ' + headBuf.toString('hex'));
+                    if ((headBuf[0] & 0x0f) !== 0) {
+                        opcode = headBuf[0] & 0x0f;
+                    }
+                    lenBuf = new Buffer(fragLen <= 125 ? 0 :
+                        (fragLen === 126 ? 2 : 8));
+                    buf = lenBuf;
                     continue;
                 }
-                frag = new Buffer(maskLen + fragLen);
-                buf = frag;
-                continue;
-            }
-            if (buf === frag) {
-                log('frag: ' + opcode + ' ' + fragLen);
-                if (maskLen) {
-                    for (i = maskLen; i < frag.length; i++) {
-                        frag[i] ^= frag[i % maskLen];
+
+                if (buf === lenBuf) {
+                    if (lenBuf.length) {
+                        fragLen =
+                            lenBuf.length === 2 ? lenBuf.readUInt16BE(0) :
+                                lenBuf.readUInt32BE(0) * 0x100000000 +
+                                    lenBuf.readUInt32BE(4);
+                        debug('lenBuf: ' + lenBuf.toString('hex'));
+                    }
+                    fragBuf = new Buffer(maskLen + fragLen);
+                    buf = fragBuf;
+                    continue;
+                }
+
+                if (buf === fragBuf) {
+                    debug('fragBuf: ' + opcode + ' ' +
+                        fragBuf.length + ' - ' + maskLen);
+                    if (maskLen) {
+                        for (i = maskLen; i < fragBuf.length; i++) {
+                            fragBuf[i] ^= fragBuf[i % maskLen];
+                        }
+                    }
+                    fragBuf = Buffer.concat([message, fragBuf.slice(maskLen)]);
+                    buf = headBuf;
+                    if ((headBuf[0] & 0x80) === 0) {  // !fin
+                        message = fragBuf;
+                        continue;
+                    }
+                    message = new Buffer(0);
+                    if ((headBuf[0] & 0xf) <= 2) {
+                        debug('message[' + fragBuf.length + ']: ' +
+                            fragBuf.toString('hex', 0, LIMIT) +
+                            (fragBuf.length > LIMIT ? '...' : ''));
+                        sock.onmessage(fragBuf, opcode);
+                        continue;
+                    }
+                    debug('control: ' + fragBuf.toString('hex'));
+                    if (opcode === 8) {  // close
+                        // FIXME: handle close
+                        continue;
+                    }
+                    if (opcode === 9) {  // ping
+                        sock.send(fragBuf, 10);
+                        continue;
+                    }
+                    if (opcode === 10) {  // pong
+                        // FIXME: handle pong
+                        continue;
                     }
                 }
-                frag = Buffer.concat([message, frag.slice(maskLen)]);
-                buf = head;
-                if ((head[0] & 0x80) === 0) {  // !fin
-                    message = frag;
-                    continue;
-                }
-                message = new Buffer(0);
-                if ((head[0] & 0xf) <= 2) {
-                    log('message[' + frag.length + ']: ' +
-                        frag.toString('hex', 0, LIMIT) +
-                        (frag.length > LIMIT ? '...' : ''));
-                    sock.onmessage(frag, opcode);
-                    continue;
-                }
-                log('control: ' + frag.toString('hex'));
-                if (opcode === 8) {  // close
-                    // FIXME: handle close
-                    continue;
-                }
-                if (opcode === 9) {  // ping
-                    sock.send(frag, 10);
-                    continue;
-                }
-                if (opcode === 10) {  // pong
-                    // FIXME: handle pong
-                    continue;
-                }
             }
-            // buf has the value of fragLen
-            fragLen = buf.length === 2 ? buf.readUInt16BE(0) :
-                buf.readUInt32BE(0) * 0x100000000 + buf.readUInt32BE(4);
-            log('len: ' + buf.toString('hex'));
-            frag = new Buffer(maskLen + fragLen);
-            buf = frag;
-        }
-    });
+        };
+    }()));
+
     sock.on('end', function () {
         // FIXME: do something
         log('socket ended...');
@@ -287,7 +332,7 @@ apps = {};
 
 serve = function (request, response, head) {
     var req = require('url').parse(request.url, true),
-        isUpgrade = typeof head != 'undefined',
+        isUpgrade = typeof head !== 'undefined',
         doLater;
     request.on('error', function (e) {
         log(e.stack);
@@ -317,9 +362,6 @@ serve = function (request, response, head) {
     };
     doLater(0, function () {
         var name, stat, appDir, appObj, appIndex, script, token;
-        if (isUpgrade && request.headers.upgrade !== 'websocket') {
-            throw new Error('Non websocket upgrade');
-        }
         if (req.pathname === '/favicon.ico') {
             response.start(404, 'text/plain', {}, 'Not found');
             return;
