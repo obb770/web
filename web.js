@@ -26,7 +26,7 @@ log = function () {
 };
 
 debug = function () {
-    if (false) {
+    if (true) {
         log.apply(this, arguments);
     }
 };
@@ -204,10 +204,31 @@ handleSocket = function (sock) {
         token).digest('base64');
     respond(token);
 
+    sock.serverClosed = false;
+    sock.clientClosed = false;
+    sock.close = function (code) {
+        var buf = new Buffer(2);
+        if (sock.serverClosed) {
+            debug('close: already closed');
+            return;
+        }
+        debug('close: closing...');
+        buf.writeUInt16BE(code, 0);
+        send(buf, 8);
+        sock.serverClosed = true;
+        if (sock.clientClosed) {
+            sock.end();
+        }
+    };
+
+    // FIXME: fragment large messages
     sock.send = function (msg, opcode) {
         var len = msg.length,
             hlen = 2,
             header = new Buffer(10);
+        if (sock.serverClosed) {
+            debug('send: already closed, ignoring');
+        }
         header[0] = 0x80 | opcode;
         header[1] = len;
         if (len > 125) {
@@ -231,7 +252,7 @@ handleSocket = function (sock) {
     };
 
     sock.on('data', (function () {
-        var opcode,
+        var msgOpcode,
             message = new Buffer(0),
             headBuf = new Buffer(2),
             lenBuf = new Buffer(0),
@@ -239,7 +260,11 @@ handleSocket = function (sock) {
             buf = headBuf,
             bufOff = 0;
         return function (data) {
-            var max, maskLen, fragLen, i;
+            var max, opcode, maskLen, fragLen, i;
+            if (sock.clientClosed) {
+                debug('closed: ignoring data [' + data.length + ']');
+                return;
+            }
             debug('data[' + data.length + ']: ' +
                 data.toString('hex', 0, LIMIT) +
                 (data.length > LIMIT ? '...' : ''));
@@ -258,10 +283,23 @@ handleSocket = function (sock) {
                 bufOff = 0;
                 maskLen = (headBuf[1] & 0x80) !== 0 ? 4 : 0;
                 fragLen = headBuf[1] & 0x7f;
+                opcode = headBuf[0] & 0x0f;
                 if (buf === headBuf) {
                     debug('headBuf: ' + headBuf.toString('hex'));
-                    if ((headBuf[0] & 0x0f) !== 0) {
-                        opcode = headBuf[0] & 0x0f;
+                    if (!maskLen) {
+                        log('No masking - closing...');
+                        sock.close(1002);
+                        return;
+                    }
+                    if ((headBuf[0] & 0x70) !== 0) {
+                        log('Non zero reserved bits - closing...');
+                        sock.close(1002);
+                        return;
+                    }
+                    if (opcode >= 3 && opcode <= 7 || opcode >= 0xb) {
+                        log('Unknown opcode: %d - closing...', opcode);
+                        sock.close(1002);
+                        return;
                     }
                     lenBuf = new Buffer(fragLen <= 125 ? 0 :
                         (fragLen === 126 ? 2 : 8));
@@ -283,38 +321,55 @@ handleSocket = function (sock) {
                 }
 
                 if (buf === fragBuf) {
-                    debug('fragBuf: ' + opcode + ' ' +
+                    buf = headBuf;
+                    debug('fragBuf: ' + msgOpcode + ' ' +
                         fragBuf.length + ' - ' + maskLen);
                     if (maskLen) {
                         for (i = maskLen; i < fragBuf.length; i++) {
                             fragBuf[i] ^= fragBuf[i % maskLen];
                         }
                     }
-                    fragBuf = Buffer.concat([message, fragBuf.slice(maskLen)]);
-                    buf = headBuf;
-                    if ((headBuf[0] & 0x80) === 0) {  // !fin
-                        message = fragBuf;
-                        continue;
-                    }
-                    message = new Buffer(0);
-                    if ((headBuf[0] & 0xf) <= 2) {
+                    if (opcode <= 2) {
+                        if (opcode !== 0) {
+                            msgOpcode = opcode;
+                        }
+                        fragBuf =
+                            Buffer.concat([message, fragBuf.slice(maskLen)]);
+                        if ((headBuf[0] & 0x80) === 0) {  // !fin
+                            message = fragBuf;
+                            continue;
+                        }
+                        message = new Buffer(0);
                         debug('message[' + fragBuf.length + ']: ' +
                             fragBuf.toString('hex', 0, LIMIT) +
                             (fragBuf.length > LIMIT ? '...' : ''));
-                        sock.onmessage(fragBuf, opcode);
+                        sock.onmessage(fragBuf, msgOpcode);
                         continue;
                     }
                     debug('control: ' + fragBuf.toString('hex'));
-                    if (opcode === 8) {  // close
-                        // FIXME: handle close
-                        continue;
+                    if ((headBuf[0] & 0x80) === 0) {  // !fin
+                        log('Fragmented control: %d - closing...', opcode);
+                        sock.close(1002);
+                        return;
                     }
-                    if (opcode === 9) {  // ping
+                    if (msgOpcode === 8) {  // close
+                        debug('client close: ' + fragBuf.readUInt16BE(0));
+                        server.clientClosed = true;
+                        if (server.serverClosed) {
+                            sock.end();
+                        }
+                        else {
+                            sock.close(fragBuf.readUInt16BE(0));
+                        }
+                        return;
+                    }
+                    if (msgOpcode === 9) {  // ping
+                        debug('ping...');
                         sock.send(fragBuf, 10);
                         continue;
                     }
-                    if (opcode === 10) {  // pong
-                        // FIXME: handle pong
+                    if (msgOpcode === 10) {  // pong
+                        debug('pong...');
                         continue;
                     }
                 }
