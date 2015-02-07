@@ -162,10 +162,12 @@ handleSocket = function (sock) {
     var request = sock.request,
         respond,
         token = request.headers['sec-websocket-key'],
-        LIMIT = 100;
+        LIMIT = 100,
+        MAX_MESSAGE = 0x100000,
+        MAX_FRAME = 0x20000;
 
     respond = function (token, message, headers) {
-        var status = token ? ' 101 websocket' : ' 400' +  + ' ' + message;
+        var status = token ? ' 101 websocket' : (' 400' + ' ' + message);
         log(request.connection.remoteAddress + ' ' +
             request.connection.remotePort + ' ' +
             request.url + status);
@@ -204,17 +206,23 @@ handleSocket = function (sock) {
         token).digest('base64');
     respond(token);
 
+    sock.setTimeout(0);
+    sock.canRead = true;
     sock.serverClosed = false;
     sock.clientClosed = false;
-    sock.close = function (code) {
-        var buf = new Buffer(2);
+
+    sock.close = function (code, reason) {
+        var buf = new Buffer(125), len = 2;
+        debug('close: %d "%s"', code, reason);
         if (sock.serverClosed) {
             debug('close: already closed');
             return;
         }
-        debug('close: closing...');
         buf.writeUInt16BE(code, 0);
-        send(buf, 8);
+        if (reason) {
+            len += buf.write(reason, 2);
+        }
+        sock.send(buf.slice(0, len), 8);
         sock.serverClosed = true;
         if (sock.clientClosed) {
             sock.end();
@@ -227,7 +235,8 @@ handleSocket = function (sock) {
             hlen = 2,
             header = new Buffer(10);
         if (sock.serverClosed) {
-            debug('send: already closed, ignoring');
+            debug('send: closed, ignoring');
+            return;
         }
         header[0] = 0x80 | opcode;
         header[1] = len;
@@ -252,123 +261,150 @@ handleSocket = function (sock) {
     };
 
     sock.on('data', (function () {
-        var msgOpcode,
-            message = new Buffer(0),
-            headBuf = new Buffer(2),
-            lenBuf = new Buffer(0),
-            fragBuf = new Buffer(0),
-            buf = headBuf,
+        var readBuf,
+            state = 'head',
+            msgOpcode,
+            message = null,
+            isFin,
+            frameOpcode,
+            frameLen,
+            frame,
+            buf = new Buffer(2),
             bufOff = 0;
+
+        readBuf = function (data) {
+            var max = buf.length - bufOff;
+            if (max > data.length) {
+                max = data.length;
+            }
+            data.copy(buf, bufOff, 0, max);
+            bufOff += max;
+            data = data.slice(max, data.length);
+            if (bufOff < buf.length) {
+                return null;
+            }
+            return data;
+        };
         return function (data) {
-            var max, opcode, maskLen, fragLen, i;
-            if (sock.clientClosed) {
-                debug('closed: ignoring data [' + data.length + ']');
+            var frame, i;
+            if (sock.clientClosed || !sock.canRead) {
+                debug('ignoring data [' + data.length + ']');
                 return;
             }
             debug('data[' + data.length + ']: ' +
                 data.toString('hex', 0, LIMIT) +
                 (data.length > LIMIT ? '...' : ''));
             while (true) {
-                max = buf.length - bufOff;
-                if (max > data.length) {
-                    max = data.length;
-                }
-                data.copy(buf, bufOff, 0, max);
-                bufOff += max;
-                data = data.slice(max, data.length);
-                if (bufOff < buf.length) {
+                data = readBuf(data);
+                if (!data) {
                     return;
                 }
-
                 bufOff = 0;
-                maskLen = (headBuf[1] & 0x80) !== 0 ? 4 : 0;
-                fragLen = headBuf[1] & 0x7f;
-                opcode = headBuf[0] & 0x0f;
-                if (buf === headBuf) {
-                    debug('headBuf: ' + headBuf.toString('hex'));
-                    if (!maskLen) {
-                        log('No masking - closing...');
-                        sock.close(1002);
+                if (state === 'head') {
+                    debug('frame head: ' + buf.toString('hex'));
+                    isFin = (buf[0] & 0x80) !== 0;
+                    if ((buf[1] & 0x80) === 0) {
+                        sock.close(1002, 'no masking');
+                        sock.canRead = false;
                         return;
                     }
-                    if ((headBuf[0] & 0x70) !== 0) {
-                        log('Non zero reserved bits - closing...');
-                        sock.close(1002);
+                    if ((buf[0] & 0x70) !== 0) {
+                        sock.close(1002, 'non zero reserved bits');
+                        sock.canRead = false;
                         return;
                     }
-                    if (opcode >= 3 && opcode <= 7 || opcode >= 0xb) {
-                        log('Unknown opcode: %d - closing...', opcode);
-                        sock.close(1002);
+                    frameOpcode = buf[0] & 0x0f;
+                    if (frameOpcode >= 3 && frameOpcode <= 7 ||
+                            frameOpcode >= 0xb) {
+                        sock.close(1002, 'unknown opcode');
+                        sock.canRead = false;
                         return;
                     }
-                    lenBuf = new Buffer(fragLen <= 125 ? 0 :
-                        (fragLen === 126 ? 2 : 8));
-                    buf = lenBuf;
+                    frameLen = buf[1] & 0x7f;
+                    if (frameLen <= 125) {
+                        state = 'data';
+                        buf = new Buffer(4 + frameLen);
+                    }
+                    else {
+                        state = 'len';
+                        buf = new Buffer(frameLen === 126 ? 2 : 8);
+                    }
                     continue;
                 }
-
-                if (buf === lenBuf) {
-                    if (lenBuf.length) {
-                        fragLen =
-                            lenBuf.length === 2 ? lenBuf.readUInt16BE(0) :
-                                lenBuf.readUInt32BE(0) * 0x100000000 +
-                                    lenBuf.readUInt32BE(4);
-                        debug('lenBuf: ' + lenBuf.toString('hex'));
+                if (state === 'len') {
+                    frameLen = buf.length === 2 ? buf.readUInt16BE(0) :
+                            buf.readUInt32BE(0) * 0x100000000 +
+                                buf.readUInt32BE(4);
+                    debug('frame len: ' + buf.toString('hex'));
+                    if (frameLen > MAX_FRAME) {
+                        sock.close(1009, 'frame is too big');
+                        sock.canRead = false;
+                        return;
                     }
-                    fragBuf = new Buffer(maskLen + fragLen);
-                    buf = fragBuf;
+                    if (frameLen +
+                            (message === null ? 0 : message.length) >
+                            MAX_MESSAGE) {
+                        sock.close(1009, 'message is too big');
+                    }
+                    state = 'data';
+                    buf = new Buffer(4 + frameLen);
                     continue;
                 }
-
-                if (buf === fragBuf) {
-                    buf = headBuf;
-                    debug('fragBuf: ' + msgOpcode + ' ' +
-                        fragBuf.length + ' - ' + maskLen);
-                    if (maskLen) {
-                        for (i = maskLen; i < fragBuf.length; i++) {
-                            fragBuf[i] ^= fragBuf[i % maskLen];
-                        }
+                if (state === 'data') {
+                    state = 'head';
+                    frame = buf;
+                    buf = new Buffer(2);
+                    debug('frame: ' + frameOpcode + ' ' + frame.length +
+                        ' - ' + 4);
+                    for (i = 4; i < frame.length; i++) {
+                        frame[i] ^= frame[i % 4];
                     }
-                    if (opcode <= 2) {
-                        if (opcode !== 0) {
-                            msgOpcode = opcode;
+                    frame = frame.slice(4);
+                    if (frameOpcode <= 2) {
+                        if (frameOpcode !== 0) {
+                            if (message !== null) {
+                                sock.close(1002, 'incomplete message');
+                                continue;
+                            }
+                            message = frame;
+                            msgOpcode = frameOpcode;
                         }
-                        fragBuf =
-                            Buffer.concat([message, fragBuf.slice(maskLen)]);
-                        if ((headBuf[0] & 0x80) === 0) {  // !fin
-                            message = fragBuf;
+                        else {
+                            frame = Buffer.concat([message, frame]);
+                        }
+                        if (!isFin) {
+                            message = frame;
                             continue;
                         }
-                        message = new Buffer(0);
-                        debug('message[' + fragBuf.length + ']: ' +
-                            fragBuf.toString('hex', 0, LIMIT) +
-                            (fragBuf.length > LIMIT ? '...' : ''));
-                        sock.onmessage(fragBuf, msgOpcode);
+                        message = null;
+                        debug('message[' + frame.length + ']: ' +
+                            frame.toString('hex', 0, LIMIT) +
+                            (frame.length > LIMIT ? '...' : ''));
+                        sock.onmessage(frame, msgOpcode);
                         continue;
                     }
-                    debug('control: ' + fragBuf.toString('hex'));
-                    if ((headBuf[0] & 0x80) === 0) {  // !fin
-                        log('Fragmented control: %d - closing...', opcode);
-                        sock.close(1002);
-                        return;
+                    debug('control: ' + frame.toString('hex'));
+                    if (!isFin) {
+                        sock.close(1002, 'fragmented control');
+                        continue;
                     }
-                    if (msgOpcode === 8) {  // close
-                        debug('client close: ' + fragBuf.readUInt16BE(0));
-                        server.clientClosed = true;
-                        if (server.serverClosed) {
+                    if (frameOpcode === 8) {  // close
+                        debug('client close: ' + frame.readUInt16BE(0));
+                        sock.clientClosed = true;
+                        if (sock.serverClosed) {
                             sock.end();
                         }
                         else {
-                            sock.close(fragBuf.readUInt16BE(0));
+                            sock.close(frame.readUInt16BE(0));
                         }
                         return;
                     }
-                    if (msgOpcode === 9) {  // ping
+                    if (frameOpcode === 9) {  // ping
                         debug('ping...');
-                        sock.send(fragBuf, 10);
+                        sock.send(frame, 10);
                         continue;
                     }
-                    if (msgOpcode === 10) {  // pong
+                    if (frameOpcode === 10) {  // pong
                         debug('pong...');
                         continue;
                     }
