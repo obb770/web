@@ -26,7 +26,7 @@ log = function () {
 };
 
 debug = function () {
-    if (true) {
+    if (false) {
         log.apply(this, arguments);
     }
 };
@@ -160,17 +160,18 @@ sendManifest = function (response, name, stat, prefix) {
 
 handleSocket = function (sock) {
     var request = sock.request,
+        logPrefix,
         respond,
         token = request.headers['sec-websocket-key'],
         LIMIT = 100,
-        MAX_MESSAGE = 0x100000,
-        MAX_FRAME = 0x20000;
+        MAX_MESSAGE = 0x100000;
 
+    logPrefix = request.connection.remoteAddress + ' ' +
+        request.connection.remotePort + ' ' +
+        request.url;
     respond = function (token, message, headers) {
         var status = token ? ' 101 websocket' : (' 400' + ' ' + message);
-        log(request.connection.remoteAddress + ' ' +
-            request.connection.remotePort + ' ' +
-            request.url + status);
+        log(logPrefix + status);
         if (token) {
             sock.write('HTTP/1.1 101 Switching Protocols\r\n' +
                 'Upgrade: websocket\r\n' +
@@ -222,15 +223,14 @@ handleSocket = function (sock) {
         if (reason) {
             len += buf.write(reason, 2);
         }
-        sock.send(buf.slice(0, len), 8);
+        sock.sendFrame(buf.slice(0, len), 8, true);
         sock.serverClosed = true;
         if (sock.clientClosed) {
             sock.end();
         }
     };
 
-    // FIXME: fragment large messages
-    sock.send = function (msg, opcode) {
+    sock.sendFrame = function (msg, opcode, isFin) {
         var len = msg.length,
             hlen = 2,
             header = new Buffer(10);
@@ -238,7 +238,7 @@ handleSocket = function (sock) {
             debug('send: closed, ignoring');
             return;
         }
-        header[0] = 0x80 | opcode;
+        header[0] = (isFin ? 0x80 : 0) | opcode;
         header[1] = len;
         if (len > 125) {
             if (len < 0x10000) {
@@ -255,7 +255,7 @@ handleSocket = function (sock) {
         }
         debug('send header: ' + header.slice(0, hlen).toString('hex'));
         sock.write(header.slice(0, hlen));
-        debug('send message: ' + msg.toString('hex', 0, LIMIT) +
+        debug('send data: ' + msg.toString('hex', 0, LIMIT) +
             (msg.length > LIMIT ? '...' : ''));
         sock.write(msg);
     };
@@ -263,30 +263,49 @@ handleSocket = function (sock) {
     sock.on('data', (function () {
         var readBuf,
             state = 'head',
-            msgOpcode,
-            message = null,
+            messageLen = 0,
             isFin,
             frameOpcode,
             frameLen,
-            frame,
+            mask,
             buf = new Buffer(2),
             bufOff = 0;
 
         readBuf = function (data) {
-            var max = buf.length - bufOff;
+            var len = state === 'data' ? frameLen : buf.length,
+                max = len - bufOff,
+                i;
             if (max > data.length) {
                 max = data.length;
             }
-            data.copy(buf, bufOff, 0, max);
+            if (state === 'data' || state === 'control') {
+                for (i = 0; i < max; i++) {
+                    data[i] ^= mask[(i + bufOff) % 4];
+                }
+            }
+            if (state === 'data') {
+                if (sock.hasOwnProperty('onframe') && sock.onframe) {
+                    debug('onframe: ' + max + ' ' +
+                        (bufOff ? 0 : frameOpcode) + ' ' +
+                        isFin + ' ' + (bufOff + max === len) + ' ' + 
+                        bufOff + '+' + max + ' ' + len);
+                    sock.onframe(data.slice(0, max),
+                        bufOff ? 0 : frameOpcode,
+                        isFin && bufOff + max === len);
+                }
+            }
+            else {
+                data.copy(buf, bufOff, 0, max);
+            }
             bufOff += max;
             data = data.slice(max, data.length);
-            if (bufOff < buf.length) {
+            if (bufOff < len) {
                 return null;
             }
             return data;
         };
         return function (data) {
-            var frame, i;
+            var control;
             if (sock.clientClosed || !sock.canRead) {
                 debug('ignoring data [' + data.length + ']');
                 return;
@@ -321,87 +340,84 @@ handleSocket = function (sock) {
                         return;
                     }
                     frameLen = buf[1] & 0x7f;
-                    if (frameLen <= 125) {
-                        state = 'data';
-                        buf = new Buffer(4 + frameLen);
-                    }
-                    else {
-                        state = 'len';
-                        buf = new Buffer(frameLen === 126 ? 2 : 8);
-                    }
+                    state = 'len';
+                    buf = new Buffer((frameLen <= 125 ? 0 : (
+                        frameLen === 126 ? 2 : 8)) + 4);
                     continue;
                 }
                 if (state === 'len') {
-                    frameLen = buf.length === 2 ? buf.readUInt16BE(0) :
-                            buf.readUInt32BE(0) * 0x100000000 +
-                                buf.readUInt32BE(4);
-                    debug('frame len: ' + buf.toString('hex'));
-                    if (frameLen > MAX_FRAME) {
-                        sock.close(1009, 'frame is too big');
-                        sock.canRead = false;
-                        return;
+                    debug('frame len + mask: ' + buf.toString('hex'));
+                    if (frameLen > 125) {
+                        frameLen = frameLen === 126 ? buf.readUInt16BE(0) :
+                                buf.readUInt32BE(0) * 0x100000000 +
+                                    buf.readUInt32BE(4);
                     }
-                    if (frameLen +
-                            (message === null ? 0 : message.length) >
-                            MAX_MESSAGE) {
+                    if (messageLen + frameLen > MAX_MESSAGE) {
                         sock.close(1009, 'message is too big');
+                        sock.onframe = null;
                     }
-                    state = 'data';
-                    buf = new Buffer(4 + frameLen);
-                    continue;
-                }
-                if (state === 'data') {
-                    state = 'head';
-                    frame = buf;
-                    buf = new Buffer(2);
-                    debug('frame: ' + frameOpcode + ' ' + frame.length +
-                        ' - ' + 4);
-                    for (i = 4; i < frame.length; i++) {
-                        frame[i] ^= frame[i % 4];
-                    }
-                    frame = frame.slice(4);
+                    mask = buf.slice(-4);
                     if (frameOpcode <= 2) {
+                        state = 'data';
+                        buf = null;
                         if (frameOpcode !== 0) {
-                            if (message !== null) {
+                            if (messageLen !== 0) {
                                 sock.close(1002, 'incomplete message');
                                 continue;
                             }
-                            message = frame;
-                            msgOpcode = frameOpcode;
                         }
                         else {
-                            frame = Buffer.concat([message, frame]);
+                            if (messageLen === 0) {
+                                sock.close(1002, 'unexpected continuation');
+                                continue;
+                            }
                         }
-                        if (!isFin) {
-                            message = frame;
-                            continue;
-                        }
-                        message = null;
-                        debug('message[' + frame.length + ']: ' +
-                            frame.toString('hex', 0, LIMIT) +
-                            (frame.length > LIMIT ? '...' : ''));
-                        sock.onmessage(frame, msgOpcode);
-                        continue;
                     }
-                    debug('control: ' + frame.toString('hex'));
+                    else {
+                        state = 'control';
+                        buf = new Buffer(frameLen);
+                    }
+                    continue;
+                }
+                if (state === 'data') {
+                    debug('data frame: ' + frameOpcode + ' ' + frameLen);
+                    if (isFin) {
+                        messageLen = 0;
+                    }
+                    else {
+                        messageLen += frameLen;
+                    }
+                    state = 'head';
+                    buf = new Buffer(2);
+                    continue;
+                }
+                if (state === 'control') {
+                    debug('control frame: ' + frameOpcode + ' ' + frameLen);
+                    debug('control[' + frameLen + '] ' + frameOpcode + ': ' +
+                        buf.toString('hex'));
+                    state = 'head';
+                    control = buf;
+                    buf = new Buffer(2);
                     if (!isFin) {
                         sock.close(1002, 'fragmented control');
                         continue;
                     }
                     if (frameOpcode === 8) {  // close
-                        debug('client close: ' + frame.readUInt16BE(0));
+                        debug('client close: ' + control.readUInt16BE(0) +
+                            ' ' + control.toString('utf8', 2));
                         sock.clientClosed = true;
                         if (sock.serverClosed) {
                             sock.end();
                         }
                         else {
-                            sock.close(frame.readUInt16BE(0));
+                            sock.close(control.readUInt16BE(0),
+                                control.toString('utf8', 2));
                         }
                         return;
                     }
                     if (frameOpcode === 9) {  // ping
                         debug('ping...');
-                        sock.send(frame, 10);
+                        sock.sendFrame(buf, 10, true);
                         continue;
                     }
                     if (frameOpcode === 10) {  // pong
@@ -415,7 +431,7 @@ handleSocket = function (sock) {
 
     sock.on('end', function () {
         // FIXME: do something
-        log('socket ended...');
+        log(logPrefix + ' socket ended...');
     });
 };
 
