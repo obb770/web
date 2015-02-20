@@ -228,6 +228,9 @@ handleSocket = function (sock) {
         if (sock.clientClosed) {
             sock.end();
         }
+        if (typeof sock.onclose === 'function') {
+            sock.onclose(code, reason);
+        }
     };
 
     sock.sendFrame = function (msg, opcode, isFin) {
@@ -284,7 +287,7 @@ handleSocket = function (sock) {
                 }
             }
             if (state === 'data') {
-                if (sock.hasOwnProperty('onframe') && sock.onframe) {
+                if (typeof sock.onframe === 'function') {
                     debug('onframe: ' + max + ' ' +
                         (bufOff ? 0 : frameOpcode) + ' ' +
                         isFin + ' ' + (bufOff + max === len) + ' ' + 
