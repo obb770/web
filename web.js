@@ -9,6 +9,7 @@ var http = require('http'),
     wwwRoot = 'www',
     log,
     debug,
+    has,
     buffer = '',
     redirect,
     types,
@@ -31,6 +32,11 @@ debug = function () {
     }
 };
 
+has = function (o, p) {
+    return o !== null && typeof(o) === 'object' &&
+        Object.hasOwnProperty.call(o, p);
+};
+
 http.ServerResponse.prototype.start = function (code, type, headers, body) {
     var msg;
     if (this.responded) {
@@ -43,7 +49,7 @@ http.ServerResponse.prototype.start = function (code, type, headers, body) {
     msg = this.request.connection.remoteAddress + ' ' +
         this.request.connection.remotePort + ' ' +
         this.request.url + ' ' + code + ' ' + type;
-    if (headers.hasOwnProperty('content-length')) {
+    if (has(headers, 'content-length')) {
         msg += ' ' + headers['content-length'];
     }
     this.writeHead(code, headers);
@@ -86,7 +92,7 @@ sendFile = function (response, name) {
         i = name.lastIndexOf('/');
     }
     type = name.substr(i + 1);
-    if (!types.hasOwnProperty(type)) {
+    if (!has(types, type)) {
         type = null;
     }
     stat = fs.existsSync(name) && fs.statSync(name);
@@ -103,7 +109,7 @@ sendFile = function (response, name) {
     code = 200;
     options = undefined;
     headers = {'content-length': size};
-    if (response.request.headers.hasOwnProperty('range')) {
+    if (has(response.request.headers, 'range')) {
         match = /bytes=(\d*)-(\d*)/.exec(response.request.headers.range);
         code = 206;
         options = {start: 0, end: size - 1};
@@ -497,7 +503,7 @@ serve = function (request, response, head) {
         }
         appDir = path.dirname(name);
         appObj = {'handlers': null};
-        if (!apps.hasOwnProperty(appDir)) {
+        if (!has(apps, appDir)) {
             appIndex = path.join(appDir, 'index.js');
             if (fs.existsSync(appIndex)) {
                 appObj.handlers = require(appIndex).handlers;
@@ -509,7 +515,7 @@ serve = function (request, response, head) {
             script = path.basename(req.pathname);
         }
         appObj = apps[appDir];
-        if (appObj.handlers && appObj.handlers.hasOwnProperty(script)) {
+        if (appObj.handlers && has(appObj.handlers, script)) {
             if (isUpgrade) {
                 handleSocket(response);
             }
