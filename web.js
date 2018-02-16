@@ -484,6 +484,7 @@ serve = function (request, response, head) {
             return;
         }
         name = req.pathname;
+        name = decodeURI(name);
         if (/\/\./.test(name) || name[0] !== '/') {
             throw new Error("Bad file");
         }
