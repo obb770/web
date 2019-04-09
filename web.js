@@ -427,7 +427,7 @@ handleSocket = function (sock) {
                     }
                     if (frameOpcode === 9) {  // ping
                         debug('ping...');
-                        sock.sendFrame(buf, 10, true);
+                        sock.sendFrame(control, 10, true);
                         continue;
                     }
                     if (frameOpcode === 10) {  // pong
